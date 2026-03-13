@@ -1,0 +1,17 @@
+# Local Store Assets
+store_assets/
+
+# Build Artifacts
+*.zip
+
+# System & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.gemini/
+.agent/
+_agent/
+.agents/
+node_modules/
+package-lock.json
