@@ -19,21 +19,26 @@
     let scrollStyleEl = null;
 
     let initialized = false;
+    const SCROLL_LOCK_CLASSES = ['no-scroll', 'noscroll', 'scroll-lock', 'locked', 'overflow-hidden'];
+    let scrollRestoreState = null;
 
     // ─── Initialization & Messaging ──────────────────────────
     chrome.runtime.sendMessage({ type: 'GET_STATE' }, (state) => {
         if (chrome.runtime.lastError) return;
         features = state || {};
-        initOnce();
+        if (features.enabled) initOnce();
         syncDomState();
     });
 
     chrome.runtime.onMessage.addListener((msg) => {
         if (msg.type === 'STATE_UPDATE') {
-            features = msg.features;
+            const hadInjectedScript = !!injectedScriptEl;
+            features = msg.features || {};
+            if (features.enabled && !initialized) initOnce();
             syncDomState();
-            // Notify injected script of the new flags
-            document.dispatchEvent(new CustomEvent('BU_UPDATE_FLAGS', { detail: features }));
+            if (hadInjectedScript) {
+                document.dispatchEvent(new CustomEvent('BU_UPDATE_FLAGS', { detail: features }));
+            }
         }
     });
 
@@ -52,6 +57,14 @@
         setupOverlayRemoval();
         setupPrintUnlock();
         setupEnforcer();
+
+        // Perform late sweeps once the full DOM is established, but only if enabled
+        window.addEventListener('load', () => {
+            if (!features.enabled) return;
+            runEnforcerPass(document);
+            if (features.overlayRemoval) scanAndRemoveOverlays();
+            if (features.printUnlock) cleanPrintStyles();
+        });
     }
 
     // Reconcile things that permanently alter the DOM without relying on live events
@@ -69,8 +82,17 @@
         if (features.scrollUnlock) injectScrollCSS();
         else removeScrollCSS();
         
-        // If password reveal toggled off, clean up fields
-        if (!features.showPassword) cleanupPasswordFields();
+        if (features.showPassword) {
+            processPasswordFields(document.querySelectorAll('input[type="password"]'));
+        } else {
+            cleanupPasswordFields();
+        }
+
+        // Perform sweeps for destructive features (only applies active ones)
+        runEnforcerPass(document);
+        if (features.overlayRemoval) scanAndRemoveOverlays();
+        if (features.dragDropUnlock) unlockExistingDraggables();
+        if (features.printUnlock) cleanPrintStyles();
     }
 
     function removeAll() {
@@ -84,6 +106,18 @@
     }
     function removeScrollCSS() {
         if (scrollStyleEl) { scrollStyleEl.remove(); scrollStyleEl = null; }
+        if (!scrollRestoreState) return;
+
+        for (const state of scrollRestoreState) {
+            const { el, removedClasses } = state;
+            if (!el) continue;
+            restoreInlineProperty(el, 'overflow', state.overflow, state.overflowPriority);
+            restoreInlineProperty(el, 'overflow-y', state.overflowY, state.overflowYPriority);
+            restoreInlineProperty(el, 'overflow-x', state.overflowX, state.overflowXPriority);
+            removedClasses.forEach((className) => el.classList.add(className));
+        }
+
+        scrollRestoreState = null;
     }
 
     // ─── Inject page-context script ──────────────────────────
@@ -121,7 +155,34 @@
      * changes persistently — these destroy SPA layouts (banking sites, etc.).
      * Aggressive position/height fixes are applied reactively by the Zapper only.
      */
+    function captureScrollRestoreState() {
+        if (scrollRestoreState) return;
+
+        scrollRestoreState = [document.documentElement, document.body]
+            .filter(Boolean)
+            .map((el) => ({
+                el,
+                overflow: el.style.getPropertyValue('overflow'),
+                overflowPriority: el.style.getPropertyPriority('overflow'),
+                overflowY: el.style.getPropertyValue('overflow-y'),
+                overflowYPriority: el.style.getPropertyPriority('overflow-y'),
+                overflowX: el.style.getPropertyValue('overflow-x'),
+                overflowXPriority: el.style.getPropertyPriority('overflow-x'),
+                removedClasses: SCROLL_LOCK_CLASSES.filter((className) => el.classList.contains(className))
+            }));
+    }
+
+    function restoreInlineProperty(el, name, value, priority) {
+        if (value) {
+            el.style.setProperty(name, value, priority || '');
+        } else {
+            el.style.removeProperty(name);
+        }
+    }
+
     function injectScrollCSS() {
+        captureScrollRestoreState();
+
         if (!scrollStyleEl) {
             const css = `
               html, body {
@@ -141,8 +202,10 @@
             [document.documentElement, document.body].forEach(el => {
                 if (!el) return;
                 el.style.setProperty('overflow', 'auto', 'important');
+                el.style.setProperty('overflow-y', 'auto', 'important');
+                el.style.setProperty('overflow-x', 'auto', 'important');
                 // Remove common scroll-lock classes used by frameworks (Bootstrap, Tailwind, etc.)
-                el.classList.remove('no-scroll', 'noscroll', 'scroll-lock', 'locked', 'overflow-hidden');
+                el.classList.remove(...SCROLL_LOCK_CLASSES);
             });
         });
     }
@@ -164,62 +227,51 @@
     }
 
     // ─── Late-Binding Recovery (Enforcer) ────────────────────
-    /**
-     * Many modern sites use "late-binding" where they apply restrictions
-     * (like onpaste="return false") dynamically after the page has loaded.
-     * The Enforcer uses a MutationObserver to instantly strip these attributes
-     * as soon as they are added to the DOM.
-     */
-    function setupEnforcer() {
-        function enforceNode(node) {
-            if (node.nodeType !== 1) return;
-            if (features.forcePaste) node.removeAttribute('onpaste');
-            if (features.forceCopy) {
-                node.removeAttribute('oncopy');
-                node.removeAttribute('oncut');
-            }
-            if (features.rightClick) node.removeAttribute('oncontextmenu');
-            if (features.unlockSelection) node.removeAttribute('onselectstart');
-            if (features.dragDropUnlock) {
-                node.removeAttribute('ondragstart');
-                if (node.getAttribute('draggable') === 'false') node.removeAttribute('draggable');
-            }
-            if (features.videoUnlock && node.tagName === 'VIDEO') {
-                node.controls = true;
-                node.style.pointerEvents = 'auto'; // Re-enable clicking if overlaid
-            }
-            if (features.autocompleteUnlock) {
-                if ((node.tagName === 'FORM' || node.tagName === 'INPUT') && node.getAttribute('autocomplete') === 'off') {
-                    node.setAttribute('autocomplete', 'on');
-                }
-                const nested = node.querySelectorAll?.('form[autocomplete="off"], input[autocomplete="off"]');
-                if (nested) nested.forEach(el => el.setAttribute('autocomplete', 'on'));
-            }
-            
-            // Ensure nested descendants are caught (like videos or draggables buried inside a mounted div)
-            if (node.querySelectorAll) {
-                if (features.videoUnlock) {
-                    node.querySelectorAll('video').forEach(v => {
-                        v.controls = true;
-                        v.style.pointerEvents = 'auto';
-                    });
-                }
-                if (features.dragDropUnlock) {
-                    node.querySelectorAll('[draggable="false"]').forEach(d => d.removeAttribute('draggable'));
-                }
-            }
+    function enforceNode(node) {
+        if (node.nodeType !== 1) return;
+        if (features.forcePaste) node.removeAttribute('onpaste');
+        if (features.forceCopy) {
+            node.removeAttribute('oncopy');
+            node.removeAttribute('oncut');
+        }
+        if (features.rightClick) node.removeAttribute('oncontextmenu');
+        if (features.unlockSelection) node.removeAttribute('onselectstart');
+        if (features.dragDropUnlock) {
+            node.removeAttribute('ondragstart');
+            if (node.getAttribute('draggable') === 'false') node.removeAttribute('draggable');
+        }
+        if (features.videoUnlock && node.tagName === 'VIDEO') {
+            node.controls = true;
+            node.style.pointerEvents = 'auto'; // Re-enable clicking if overlaid
+        }
+        if (features.autocompleteUnlock &&
+            (node.tagName === 'FORM' || node.tagName === 'INPUT') &&
+            node.getAttribute('autocomplete') === 'off') {
+            node.setAttribute('autocomplete', 'on');
+        }
+    }
+
+    function runEnforcerPass(root = document) {
+        if (!features.enabled) return;
+
+        if (root === document) {
+            document.querySelectorAll('*').forEach(enforceNode);
+            return;
         }
 
-        // Process existing body
-        document.querySelectorAll('*').forEach(enforceNode);
+        if (!root || root.nodeType !== 1) return;
+        enforceNode(root);
+        root.querySelectorAll('*').forEach(enforceNode);
+    }
 
+    function setupEnforcer() {
         enforcerObserver = new MutationObserver((mutations) => {
             if (!features.enabled) return;
             let checkCss = false;
 
             for (const m of mutations) {
                 // Enforce on new nodes
-                for (const node of m.addedNodes) enforceNode(node);
+                for (const node of m.addedNodes) runEnforcerPass(node);
 
                 // Enforce if an attribute was changed
                 if (m.type === 'attributes') enforceNode(m.target);
@@ -316,8 +368,6 @@
     const passwordListeners = new WeakMap();
 
     function setupPasswordReveal() {
-        processPasswordFields(document.querySelectorAll('input[type="password"]'));
-
         passwordObserver = new MutationObserver((mutations) => {
             for (const m of mutations) {
                 for (const node of m.addedNodes) {
@@ -374,26 +424,24 @@
     }
 
     // ─── Overlay Removal ─────────────────────────────────────
+    function scanAndRemoveOverlays() {
+        document.querySelectorAll('div, section, aside').forEach((el) => {
+            const style = getComputedStyle(el);
+            const isOverlay =
+                (style.position === 'fixed' || style.position === 'absolute') &&
+                parseInt(style.zIndex, 10) > 999 &&
+                parseFloat(style.opacity) < 0.15 &&
+                el.children.length === 0 &&
+                el.textContent.trim() === '';
+
+            if (isOverlay) {
+                el.style.pointerEvents = 'none';
+                el.style.display = 'none';
+            }
+        });
+    }
+
     function setupOverlayRemoval() {
-        function scanAndRemoveOverlays() {
-            document.querySelectorAll('div, section, aside').forEach((el) => {
-                const style = getComputedStyle(el);
-                const isOverlay =
-                    (style.position === 'fixed' || style.position === 'absolute') &&
-                    parseInt(style.zIndex, 10) > 999 &&
-                    parseFloat(style.opacity) < 0.15 &&
-                    el.children.length === 0 &&
-                    el.textContent.trim() === '';
-
-                if (isOverlay) {
-                    el.style.pointerEvents = 'none';
-                    el.style.display = 'none';
-                }
-            });
-        }
-
-        scanAndRemoveOverlays();
-
         overlayObserver = new MutationObserver(() => {
             if (features.enabled && features.overlayRemoval) {
                 scanAndRemoveOverlays();
@@ -405,49 +453,47 @@
     }
 
     // ─── Drag & Drop Unlock ──────────────────────────────────
-    function unlockDragDrop() {
-        document.addEventListener('dragstart', (e) => {
-            if (!features.enabled || !features.dragDropUnlock) return;
-            e.stopImmediatePropagation();
-        }, true);
-
-        // Remove draggable="false" from all elements
+    function unlockExistingDraggables() {
         document.querySelectorAll('[draggable="false"]').forEach((el) => {
             el.removeAttribute('draggable');
         });
     }
 
+    function unlockDragDrop() {
+        document.addEventListener('dragstart', (e) => {
+            if (!features.enabled || !features.dragDropUnlock) return;
+            e.stopImmediatePropagation();
+        }, true);
+    }
+
     // ─── Print Unlock ────────────────────────────────────────
-    function setupPrintUnlock() {
-        // Remove @media print { display: none } rules
-        function cleanPrintStyles() {
-            try {
-                for (const sheet of document.styleSheets) {
-                    try {
-                        const rules = sheet.cssRules || sheet.rules;
-                        if (!rules) continue;
-                        for (let i = rules.length - 1; i >= 0; i--) {
-                            const rule = rules[i];
-                            if (rule instanceof CSSMediaRule &&
-                                rule.conditionText?.includes('print')) {
-                                // Check if rules inside hide content
-                                const ruleText = rule.cssText.toLowerCase();
-                                if (ruleText.includes('display') && ruleText.includes('none') ||
-                                    ruleText.includes('visibility') && ruleText.includes('hidden')) {
-                                    sheet.deleteRule(i);
-                                }
+    function cleanPrintStyles() {
+        try {
+            for (const sheet of document.styleSheets) {
+                try {
+                    const rules = sheet.cssRules || sheet.rules;
+                    if (!rules) continue;
+                    for (let i = rules.length - 1; i >= 0; i--) {
+                        const rule = rules[i];
+                        if (rule instanceof CSSMediaRule &&
+                            rule.conditionText?.includes('print')) {
+                            // Check if rules inside hide content
+                            const ruleText = rule.cssText.toLowerCase();
+                            if (ruleText.includes('display') && ruleText.includes('none') ||
+                                ruleText.includes('visibility') && ruleText.includes('hidden')) {
+                                sheet.deleteRule(i);
                             }
                         }
-                    } catch (_) { /* CORS-protected stylesheet */ }
-                }
-            } catch (_) { }
-        }
+                    }
+                } catch (_) { /* CORS-protected stylesheet */ }
+            }
+        } catch (_) { }
+    }
 
-        if (document.readyState === 'complete') {
-            cleanPrintStyles();
-        } else {
-            window.addEventListener('load', cleanPrintStyles);
-        }
+    function setupPrintUnlock() {
+        window.addEventListener('load', () => {
+            if (features.enabled && features.printUnlock) cleanPrintStyles();
+        });
 
         printStyleObserver = new MutationObserver(() => {
             if (features.enabled && features.printUnlock) cleanPrintStyles();
