@@ -18,56 +18,72 @@
     let enforcerObserver = null;
     let scrollStyleEl = null;
 
+    let initialized = false;
+
     // ─── Initialization & Messaging ──────────────────────────
-    // Request initial state from the background service worker
     chrome.runtime.sendMessage({ type: 'GET_STATE' }, (state) => {
         if (chrome.runtime.lastError) return;
         features = state || {};
-        if (features.enabled) applyAll();
+        initOnce();
+        syncDomState();
     });
 
-    // Live updates from background
     chrome.runtime.onMessage.addListener((msg) => {
         if (msg.type === 'STATE_UPDATE') {
-            const prev = features;
             features = msg.features;
-            if (features.enabled) {
-                applyAll();
-            } else {
-                removeAll();
-            }
+            syncDomState();
+            // Notify injected script of the new flags
+            document.dispatchEvent(new CustomEvent('BU_UPDATE_FLAGS', { detail: features }));
         }
     });
 
-    // ─── Apply all features ──────────────────────────────────
-    function applyAll() {
-        try {
-            injectPageScript();
-            if (features.unlockSelection) injectSelectionCSS();
-            if (features.forcePaste) setupForcePaste();
-            if (features.forceCopy) setupForceCopy();
-            if (features.rightClick) setupRightClick();
-            if (features.showPassword) setupPasswordReveal();
-            if (features.overlayRemoval) setupOverlayRemoval();
-            if (features.dragDropUnlock) unlockDragDrop();
-            if (features.printUnlock) setupPrintUnlock();
-            if (features.scrollUnlock) injectScrollCSS();
-            if (features.zapperUnlock) setupZapper();
-            setupEnforcer();
-        } catch (_) { /* Isolate errors so individual feature failures don't break the page */ }
+    function initOnce() {
+        if (initialized) return;
+        initialized = true;
+
+        // Register all listeners/observers exactly once.
+        // They will dynamically check `features.enabled && features.xxx`.
+        setupForcePaste();
+        setupForceCopy();
+        setupRightClick();
+        unlockDragDrop();
+        setupZapper();
+        setupPasswordReveal();
+        setupOverlayRemoval();
+        setupPrintUnlock();
+        setupEnforcer();
+    }
+
+    // Reconcile things that permanently alter the DOM without relying on live events
+    function syncDomState() {
+        if (!features.enabled) {
+            removeAll();
+            return;
+        }
+        
+        injectPageScript();
+
+        if (features.unlockSelection) injectSelectionCSS();
+        else removeSelectionCSS();
+
+        if (features.scrollUnlock) injectScrollCSS();
+        else removeScrollCSS();
+        
+        // If password reveal toggled off, clean up fields
+        if (!features.showPassword) cleanupPasswordFields();
     }
 
     function removeAll() {
-        if (injectedStyleEl) { injectedStyleEl.remove(); injectedStyleEl = null; }
-        if (scrollStyleEl) { scrollStyleEl.remove(); scrollStyleEl = null; }
-        if (passwordObserver) { passwordObserver.disconnect(); passwordObserver = null; }
-        if (overlayObserver) { overlayObserver.disconnect(); overlayObserver = null; }
-        if (printStyleObserver) { printStyleObserver.disconnect(); printStyleObserver = null; }
-        if (enforcerObserver) { enforcerObserver.disconnect(); enforcerObserver = null; }
+        removeSelectionCSS();
+        removeScrollCSS();
         cleanupPasswordFields();
-        // Note: injected script can't easily be "un-injected" since prototypes
-        // are already overridden, but toggling off the master switch prevents
-        // re-injection on next navigation.
+    }
+
+    function removeSelectionCSS() {
+        if (injectedStyleEl) { injectedStyleEl.remove(); injectedStyleEl = null; }
+    }
+    function removeScrollCSS() {
+        if (scrollStyleEl) { scrollStyleEl.remove(); scrollStyleEl = null; }
     }
 
     // ─── Inject page-context script ──────────────────────────
@@ -173,10 +189,23 @@
                 node.style.pointerEvents = 'auto'; // Re-enable clicking if overlaid
             }
             if (features.autocompleteUnlock) {
-                if (node.tagName === 'FORM' || node.tagName === 'INPUT') {
-                    if (node.getAttribute('autocomplete') === 'off') {
-                        node.setAttribute('autocomplete', 'on');
-                    }
+                if ((node.tagName === 'FORM' || node.tagName === 'INPUT') && node.getAttribute('autocomplete') === 'off') {
+                    node.setAttribute('autocomplete', 'on');
+                }
+                const nested = node.querySelectorAll?.('form[autocomplete="off"], input[autocomplete="off"]');
+                if (nested) nested.forEach(el => el.setAttribute('autocomplete', 'on'));
+            }
+            
+            // Ensure nested descendants are caught (like videos or draggables buried inside a mounted div)
+            if (node.querySelectorAll) {
+                if (features.videoUnlock) {
+                    node.querySelectorAll('video').forEach(v => {
+                        v.controls = true;
+                        v.style.pointerEvents = 'auto';
+                    });
+                }
+                if (features.dragDropUnlock) {
+                    node.querySelectorAll('[draggable="false"]').forEach(d => d.removeAttribute('draggable'));
                 }
             }
         }
@@ -212,7 +241,7 @@
             childList: true,
             subtree: true,
             attributes: true,
-            attributeFilter: ['onpaste', 'oncopy', 'oncut', 'oncontextmenu', 'onselectstart', 'ondragstart', 'draggable']
+            attributeFilter: ['onpaste', 'oncopy', 'oncut', 'oncontextmenu', 'onselectstart', 'ondragstart', 'draggable', 'autocomplete']
         });
     }
 
@@ -226,6 +255,7 @@
         document.addEventListener('paste', (e) => {
             if (!features.enabled || !features.forcePaste) return;
             e.stopImmediatePropagation();
+            e.preventDefault(); // CRUCIAL: Cancels browser default to prevent double-pasting
 
             // Get pasted text from clipboard
             const text = (e.clipboardData || window.clipboardData)?.getData('text');

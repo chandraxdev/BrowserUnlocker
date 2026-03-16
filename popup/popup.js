@@ -14,6 +14,11 @@
         overlayRemoval: true,
         dragDropUnlock: true,
         printUnlock: true,
+        scrollUnlock: true,
+        videoUnlock: true,
+        autocompleteUnlock: true,
+        beforeUnloadBypass: true,
+        zapperUnlock: true,
         enabled: true
     };
 
