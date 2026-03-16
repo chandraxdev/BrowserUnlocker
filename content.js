@@ -21,6 +21,9 @@
     let initialized = false;
     const SCROLL_LOCK_CLASSES = ['no-scroll', 'noscroll', 'scroll-lock', 'locked', 'overflow-hidden'];
     let scrollRestoreState = null;
+    const overlayRestoreState = new Map();
+    const dragDropRestoreState = new Map();
+    const removedPrintRules = new Map();
 
     // ─── Initialization & Messaging ──────────────────────────
     chrome.runtime.sendMessage({ type: 'GET_STATE' }, (state) => {
@@ -91,14 +94,22 @@
         // Perform sweeps for destructive features (only applies active ones)
         runEnforcerPass(document);
         if (features.overlayRemoval) scanAndRemoveOverlays();
+        else restoreOverlayState();
+
         if (features.dragDropUnlock) unlockExistingDraggables();
+        else restoreDraggableState();
+
         if (features.printUnlock) cleanPrintStyles();
+        else restorePrintStyles();
     }
 
     function removeAll() {
         removeSelectionCSS();
         removeScrollCSS();
         cleanupPasswordFields();
+        restoreOverlayState();
+        restoreDraggableState();
+        restorePrintStyles();
     }
 
     function removeSelectionCSS() {
@@ -238,7 +249,12 @@
         if (features.unlockSelection) node.removeAttribute('onselectstart');
         if (features.dragDropUnlock) {
             node.removeAttribute('ondragstart');
-            if (node.getAttribute('draggable') === 'false') node.removeAttribute('draggable');
+            if (node.getAttribute('draggable') === 'false') {
+                if (!dragDropRestoreState.has(node)) {
+                    dragDropRestoreState.set(node, node.getAttribute('draggable'));
+                }
+                node.removeAttribute('draggable');
+            }
         }
         if (features.videoUnlock && node.tagName === 'VIDEO') {
             node.controls = true;
@@ -435,10 +451,27 @@
                 el.textContent.trim() === '';
 
             if (isOverlay) {
+                if (!overlayRestoreState.has(el)) {
+                    overlayRestoreState.set(el, {
+                        display: el.style.getPropertyValue('display'),
+                        displayPriority: el.style.getPropertyPriority('display'),
+                        pointerEvents: el.style.getPropertyValue('pointer-events'),
+                        pointerEventsPriority: el.style.getPropertyPriority('pointer-events')
+                    });
+                }
                 el.style.pointerEvents = 'none';
                 el.style.display = 'none';
             }
         });
+    }
+
+    function restoreOverlayState() {
+        for (const [el, state] of overlayRestoreState.entries()) {
+            if (!el) continue;
+            restoreInlineProperty(el, 'display', state.display, state.displayPriority);
+            restoreInlineProperty(el, 'pointer-events', state.pointerEvents, state.pointerEventsPriority);
+        }
+        overlayRestoreState.clear();
     }
 
     function setupOverlayRemoval() {
@@ -455,8 +488,20 @@
     // ─── Drag & Drop Unlock ──────────────────────────────────
     function unlockExistingDraggables() {
         document.querySelectorAll('[draggable="false"]').forEach((el) => {
+            if (!dragDropRestoreState.has(el)) {
+                dragDropRestoreState.set(el, el.getAttribute('draggable'));
+            }
             el.removeAttribute('draggable');
         });
+    }
+
+    function restoreDraggableState() {
+        for (const [el, value] of dragDropRestoreState.entries()) {
+            if (el && el.isConnected && !el.hasAttribute('draggable') && value !== null) {
+                el.setAttribute('draggable', value);
+            }
+        }
+        dragDropRestoreState.clear();
     }
 
     function unlockDragDrop() {
@@ -481,6 +526,13 @@
                             const ruleText = rule.cssText.toLowerCase();
                             if (ruleText.includes('display') && ruleText.includes('none') ||
                                 ruleText.includes('visibility') && ruleText.includes('hidden')) {
+                                if (!removedPrintRules.has(sheet)) {
+                                    removedPrintRules.set(sheet, []);
+                                }
+                                const removedRules = removedPrintRules.get(sheet);
+                                if (!removedRules.some((entry) => entry.index === i && entry.cssText === rule.cssText)) {
+                                    removedRules.push({ index: i, cssText: rule.cssText });
+                                }
                                 sheet.deleteRule(i);
                             }
                         }
@@ -488,6 +540,19 @@
                 } catch (_) { /* CORS-protected stylesheet */ }
             }
         } catch (_) { }
+    }
+
+    function restorePrintStyles() {
+        for (const [sheet, rules] of removedPrintRules.entries()) {
+            try {
+                const orderedRules = [...rules].sort((a, b) => a.index - b.index);
+                for (const rule of orderedRules) {
+                    const targetIndex = Math.min(rule.index, sheet.cssRules?.length ?? 0);
+                    sheet.insertRule(rule.cssText, targetIndex);
+                }
+            } catch (_) { }
+        }
+        removedPrintRules.clear();
     }
 
     function setupPrintUnlock() {

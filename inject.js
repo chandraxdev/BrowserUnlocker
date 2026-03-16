@@ -24,16 +24,20 @@
     const noop = () => { };
     const origDefineProperty = Object.defineProperty;
     const origAddEventListener = EventTarget.prototype.addEventListener;
+    const origRemoveEventListener = EventTarget.prototype.removeEventListener;
     const origPreventDefault = Event.prototype.preventDefault;
     const origSetInterval = window.setInterval;
     const origSetTimeout = window.setTimeout;
     const nativePrint = window.print.bind(window);
+    const propertyGateReplayers = [];
 
     const state = {
         flags: { ...incomingFlags },
         blockedEvents: new Set(),
         blockedDocumentProps: new Set(),
-        blockedWindowProps: new Set()
+        blockedWindowProps: new Set(),
+        pendingEventListeners: [],
+        pendingDefineProperties: []
     };
 
     function featureEnabled(flagName) {
@@ -106,9 +110,71 @@
         }
     }
 
+    function eventCaptureKey(options) {
+        if (options === undefined) return false;
+        if (typeof options === 'boolean') return options;
+        return !!options?.capture;
+    }
+
+    function queuePendingEventListener(target, type, listener, options) {
+        state.pendingEventListeners.push({
+            target,
+            type,
+            listener,
+            options,
+            capture: eventCaptureKey(options)
+        });
+    }
+
+    function removePendingEventListener(target, type, listener, options) {
+        const capture = eventCaptureKey(options);
+        state.pendingEventListeners = state.pendingEventListeners.filter((entry) => {
+            return !(entry.target === target &&
+                entry.type === type &&
+                entry.listener === listener &&
+                entry.capture === capture);
+        });
+    }
+
+    function replayPendingEventListeners() {
+        state.pendingEventListeners = state.pendingEventListeners.filter((entry) => {
+            if (state.blockedEvents.has(entry.type)) return true;
+            try {
+                Reflect.apply(origAddEventListener, entry.target, [entry.type, entry.listener, entry.options]);
+            } catch (_) { }
+            return false;
+        });
+    }
+
+    function isDefinePropertyBlocked(obj, prop) {
+        return (obj === document && state.blockedDocumentProps.has(prop)) ||
+            (obj === window && state.blockedWindowProps.has(prop));
+    }
+
+    function queuePendingDefineProperty(obj, prop, descriptor) {
+        state.pendingDefineProperties = state.pendingDefineProperties.filter((entry) => {
+            return !(entry.obj === obj && entry.prop === prop);
+        });
+
+        state.pendingDefineProperties.push({ obj, prop, descriptor });
+    }
+
+    function replayPendingDefineProperties() {
+        state.pendingDefineProperties = state.pendingDefineProperties.filter((entry) => {
+            if (isDefinePropertyBlocked(entry.obj, entry.prop)) return true;
+            try {
+                origDefineProperty(entry.obj, entry.prop, entry.descriptor);
+            } catch (_) { }
+            return false;
+        });
+    }
+
     function updateFlags(nextFlags = {}) {
         state.flags = { ...state.flags, ...nextFlags };
         syncBlockedGuards();
+        replayPendingEventListeners();
+        replayPendingDefineProperties();
+        propertyGateReplayers.forEach((replay) => replay());
     }
 
     function installEventPropertyGate(target, prop, isBlocked) {
@@ -117,7 +183,24 @@
         const descriptor = findDescriptor(target, prop);
         if (!descriptor) return;
 
-        const fallbackValues = new WeakMap();
+        const fallbackValues = new Map();
+        const blockedValues = new Map();
+
+        function replayPendingAssignments() {
+            if (isBlocked()) return;
+            for (const [receiver, value] of blockedValues.entries()) {
+                try {
+                    if (typeof descriptor.set === 'function') {
+                        descriptor.set.call(receiver, value);
+                    } else {
+                        fallbackValues.set(receiver, value);
+                    }
+                } catch (_) { }
+                blockedValues.delete(receiver);
+            }
+        }
+
+        propertyGateReplayers.push(replayPendingAssignments);
 
         try {
             origDefineProperty(target, prop, {
@@ -132,7 +215,12 @@
                     return descriptor.value;
                 },
                 set(value) {
-                    if (isBlocked()) return true;
+                    if (isBlocked()) {
+                        blockedValues.set(this, value);
+                        return true;
+                    }
+
+                    blockedValues.delete(this);
                     if (typeof descriptor.set === 'function') {
                         descriptor.set.call(this, value);
                         return true;
@@ -140,7 +228,7 @@
                     fallbackValues.set(this, value);
                     return true;
                 },
-                configurable: false,
+                configurable: descriptor.configurable ?? true,
                 enumerable: descriptor.enumerable ?? true
             });
         } catch (_) { }
@@ -167,10 +255,8 @@
         Object.defineProperty = new Proxy(origDefineProperty, {
             apply(target, thisArg, argumentsList) {
                 const [obj, prop] = argumentsList;
-                if (obj === document && state.blockedDocumentProps.has(prop)) {
-                    return obj;
-                }
-                if (obj === window && state.blockedWindowProps.has(prop)) {
+                if (isDefinePropertyBlocked(obj, prop)) {
+                    queuePendingDefineProperty(obj, prop, argumentsList[2]);
                     return obj;
                 }
                 return Reflect.apply(target, thisArg, argumentsList);
@@ -182,7 +268,19 @@
         EventTarget.prototype.addEventListener = new Proxy(origAddEventListener, {
             apply(target, thisArg, argumentsList) {
                 const type = argumentsList[0];
-                if (state.blockedEvents.has(type)) return;
+                if (state.blockedEvents.has(type)) {
+                    queuePendingEventListener(thisArg, type, argumentsList[1], argumentsList[2]);
+                    return;
+                }
+                return Reflect.apply(target, thisArg, argumentsList);
+            }
+        });
+    } catch (_) { }
+
+    try {
+        EventTarget.prototype.removeEventListener = new Proxy(origRemoveEventListener, {
+            apply(target, thisArg, argumentsList) {
+                removePendingEventListener(thisArg, argumentsList[0], argumentsList[1], argumentsList[2]);
                 return Reflect.apply(target, thisArg, argumentsList);
             }
         });
@@ -275,6 +373,7 @@
 
     const hiddenDescriptor = findDescriptor(document, 'hidden');
     const visibilityStateDescriptor = findDescriptor(document, 'visibilityState');
+    const printDescriptor = findDescriptor(window, 'print');
 
     try {
         if (hiddenDescriptor && typeof hiddenDescriptor.get === 'function') {
@@ -283,7 +382,8 @@
                     if (featureEnabled('visibilityBypass')) return false;
                     return hiddenDescriptor.get.call(document);
                 },
-                configurable: false
+                configurable: hiddenDescriptor.configurable ?? true,
+                enumerable: hiddenDescriptor.enumerable ?? false
             });
         }
 
@@ -293,13 +393,15 @@
                     if (featureEnabled('visibilityBypass')) return 'visible';
                     return visibilityStateDescriptor.get.call(document);
                 },
-                configurable: false
+                configurable: visibilityStateDescriptor.configurable ?? true,
+                enumerable: visibilityStateDescriptor.enumerable ?? false
             });
         }
     } catch (_) { }
 
     try {
         let assignedPrint = null;
+        let blockedPrintAssignment = null;
 
         origDefineProperty(window, 'print', {
             get() {
@@ -307,11 +409,22 @@
                 return assignedPrint || nativePrint;
             },
             set(value) {
-                if (featureEnabled('printUnlock')) return true;
+                if (featureEnabled('printUnlock')) {
+                    blockedPrintAssignment = value;
+                    return true;
+                }
                 assignedPrint = value;
                 return true;
             },
-            configurable: false
+            configurable: printDescriptor?.configurable ?? true,
+            enumerable: printDescriptor?.enumerable ?? false
+        });
+
+        propertyGateReplayers.push(() => {
+            if (!featureEnabled('printUnlock') && blockedPrintAssignment) {
+                assignedPrint = blockedPrintAssignment;
+                blockedPrintAssignment = null;
+            }
         });
     } catch (_) { }
 })();

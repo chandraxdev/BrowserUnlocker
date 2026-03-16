@@ -14,4 +14,3 @@ Thumbs.db
 _agent/
 .agents/
 node_modules/
-package-lock.json
