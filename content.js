@@ -318,13 +318,18 @@
     }
 
     // ─── Clipboard & Event Restoration ───────────────────────
+    function addGlobalCaptureListener(type, handler) {
+        window.addEventListener(type, handler, true);
+        document.addEventListener(type, handler, true);
+    }
+
     /**
      * BrowserUnlocker uses the Capture Phase (true) for event listeners
      * to intercept and stop 'paste' / 'copy' events before the website's
      * own listeners can reach them.
      */
     function setupForcePaste() {
-        document.addEventListener('paste', (e) => {
+        addGlobalCaptureListener('paste', (e) => {
             if (!features.enabled || !features.forcePaste) return;
             e.stopImmediatePropagation();
             e.preventDefault(); // CRUCIAL: Cancels browser default to prevent double-pasting
@@ -350,37 +355,37 @@
                     target.dispatchEvent(new Event('change', { bubbles: true }));
                 }
             }
-        }, true); // capture phase
+        });
     }
 
     // ─── Force Copy & Cut ────────────────────────────────────
     function setupForceCopy() {
-        document.addEventListener('copy', (e) => {
+        addGlobalCaptureListener('copy', (e) => {
             if (!features.enabled || !features.forceCopy) return;
             e.stopImmediatePropagation();
-        }, true);
+        });
 
-        document.addEventListener('cut', (e) => {
+        addGlobalCaptureListener('cut', (e) => {
             if (!features.enabled || !features.forceCopy) return;
             e.stopImmediatePropagation();
-        }, true);
+        });
 
         // Also protect Ctrl+C / Ctrl+X / Ctrl+A from being swallowed
-        document.addEventListener('keydown', (e) => {
+        addGlobalCaptureListener('keydown', (e) => {
             if (!features.enabled || !features.forceCopy || !e.key) return;
             const key = e.key.toLowerCase();
             if ((e.ctrlKey || e.metaKey) && (key === 'c' || key === 'x' || key === 'a')) {
                 e.stopImmediatePropagation();
             }
-        }, true);
+        });
     }
 
     // ─── Right-Click ─────────────────────────────────────────
     function setupRightClick() {
-        document.addEventListener('contextmenu', (e) => {
+        addGlobalCaptureListener('contextmenu', (e) => {
             if (!features.enabled || !features.rightClick) return;
             e.stopImmediatePropagation();
-        }, true);
+        });
     }
 
     // ─── Show Password on Hover / Focus ──────────────────────
@@ -509,10 +514,10 @@
     }
 
     function unlockDragDrop() {
-        document.addEventListener('dragstart', (e) => {
+        addGlobalCaptureListener('dragstart', (e) => {
             if (!features.enabled || !features.dragDropUnlock) return;
             e.stopImmediatePropagation();
-        }, true);
+        });
     }
 
     // ─── Print Unlock ────────────────────────────────────────
