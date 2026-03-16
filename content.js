@@ -53,6 +53,7 @@
         // They will dynamically check `features.enabled && features.xxx`.
         setupForcePaste();
         setupForceCopy();
+        setupSelectionGuard();
         setupRightClick();
         unlockDragDrop();
         setupZapper();
@@ -159,6 +160,13 @@
         injectedStyleEl.id = 'bu-unlock-selection';
         injectedStyleEl.textContent = css;
         (document.head || document.documentElement).appendChild(injectedStyleEl);
+    }
+
+    function setupSelectionGuard() {
+        addGlobalCaptureListener('selectstart', (e) => {
+            if (!features.enabled || !features.unlockSelection) return;
+            e.stopImmediatePropagation();
+        });
     }
 
     // ─── Scroll Unlock CSS ───────────────────────────────────
