@@ -20,7 +20,7 @@
 
     let initialized = false;
     const SCROLL_LOCK_CLASSES = ['no-scroll', 'noscroll', 'scroll-lock', 'locked', 'overflow-hidden'];
-    let scrollRestoreState = null;
+    let scrollRestoreState = new Map();
     const overlayRestoreState = new Map();
     const dragDropRestoreState = new Map();
     const removedPrintRules = new Map();
@@ -64,6 +64,7 @@
         // Perform late sweeps once the full DOM is established, but only if enabled
         window.addEventListener('load', () => {
             if (!features.enabled) return;
+            if (features.scrollUnlock) injectScrollCSS();
             runEnforcerPass(document);
             if (features.overlayRemoval) scanAndRemoveOverlays();
             if (features.printUnlock) cleanPrintStyles();
@@ -117,9 +118,9 @@
     }
     function removeScrollCSS() {
         if (scrollStyleEl) { scrollStyleEl.remove(); scrollStyleEl = null; }
-        if (!scrollRestoreState) return;
+        if (scrollRestoreState.size === 0) return;
 
-        for (const state of scrollRestoreState) {
+        for (const state of scrollRestoreState.values()) {
             const { el, removedClasses } = state;
             if (!el) continue;
             restoreInlineProperty(el, 'overflow', state.overflow, state.overflowPriority);
@@ -128,7 +129,7 @@
             removedClasses.forEach((className) => el.classList.add(className));
         }
 
-        scrollRestoreState = null;
+        scrollRestoreState.clear();
     }
 
     // ─── Inject page-context script ──────────────────────────
@@ -166,21 +167,23 @@
      * changes persistently — these destroy SPA layouts (banking sites, etc.).
      * Aggressive position/height fixes are applied reactively by the Zapper only.
      */
-    function captureScrollRestoreState() {
-        if (scrollRestoreState) return;
+    function captureScrollRestoreStateFor(el) {
+        if (!el || scrollRestoreState.has(el)) return;
 
-        scrollRestoreState = [document.documentElement, document.body]
-            .filter(Boolean)
-            .map((el) => ({
-                el,
-                overflow: el.style.getPropertyValue('overflow'),
-                overflowPriority: el.style.getPropertyPriority('overflow'),
-                overflowY: el.style.getPropertyValue('overflow-y'),
-                overflowYPriority: el.style.getPropertyPriority('overflow-y'),
-                overflowX: el.style.getPropertyValue('overflow-x'),
-                overflowXPriority: el.style.getPropertyPriority('overflow-x'),
-                removedClasses: SCROLL_LOCK_CLASSES.filter((className) => el.classList.contains(className))
-            }));
+        scrollRestoreState.set(el, {
+            el,
+            overflow: el.style.getPropertyValue('overflow'),
+            overflowPriority: el.style.getPropertyPriority('overflow'),
+            overflowY: el.style.getPropertyValue('overflow-y'),
+            overflowYPriority: el.style.getPropertyPriority('overflow-y'),
+            overflowX: el.style.getPropertyValue('overflow-x'),
+            overflowXPriority: el.style.getPropertyPriority('overflow-x'),
+            removedClasses: SCROLL_LOCK_CLASSES.filter((className) => el.classList.contains(className))
+        });
+    }
+
+    function captureScrollRestoreState() {
+        [document.documentElement, document.body].forEach(captureScrollRestoreStateFor);
     }
 
     function restoreInlineProperty(el, name, value, priority) {
@@ -212,6 +215,7 @@
         requestAnimationFrame(() => {
             [document.documentElement, document.body].forEach(el => {
                 if (!el) return;
+                captureScrollRestoreStateFor(el);
                 el.style.setProperty('overflow', 'auto', 'important');
                 el.style.setProperty('overflow-y', 'auto', 'important');
                 el.style.setProperty('overflow-x', 'auto', 'important');
