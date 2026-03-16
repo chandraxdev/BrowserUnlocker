@@ -29,14 +29,34 @@ const DEFAULT_STATE = {
   enabled: true          // Main Master Switch
 };
 
+function getStoredFeatures(callback) {
+  chrome.storage.local.get('features', (result) => {
+    callback(result.features || DEFAULT_STATE);
+  });
+}
+
+function syncBadgeFromStorage() {
+  getStoredFeatures((features) => {
+    updateBadge(features.enabled);
+  });
+}
+
 // Initialise storage on install
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.get('features', (result) => {
     if (!result.features) {
-      chrome.storage.local.set({ features: DEFAULT_STATE });
+      chrome.storage.local.set({ features: DEFAULT_STATE }, () => {
+        updateBadge(DEFAULT_STATE.enabled);
+      });
+      return;
     }
+
+    updateBadge(result.features.enabled);
   });
-  updateBadge(true);
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  syncBadgeFromStorage();
 });
 
 // ── State Synchronization ──
@@ -74,6 +94,10 @@ function updateBadge(enabled) {
   });
   chrome.action.setBadgeTextColor({ color: '#ffffff' });
 }
+
+// Refresh the badge whenever the worker wakes up so browser restarts pick up
+// the persisted state even before the popup is opened or a toggle changes.
+syncBadgeFromStorage();
 
 // Content script asks for current state on load
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

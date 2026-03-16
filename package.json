@@ -1,0 +1,15 @@
+{
+  "name": "browserunlocker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "node --test --test-concurrency=1 test/background.test.js test/content.test.js test/inject.test.js",
+    "test:e2e": "node --test --test-concurrency=1 e2e/extension.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0",
+    "playwright": "^1.55.0"
+  }
+}
