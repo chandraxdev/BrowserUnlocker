@@ -4,10 +4,7 @@
   "version": "1.0.0",
   "description": "Take back your browser. Restore native paste, copy, text selection, right-click menus, and password visibility on any website.",
   "permissions": [
-    "activeTab",
-    "storage",
-    "clipboardWrite",
-    "clipboardRead"
+    "storage"
   ],
   "host_permissions": [
     "<all_urls>"
