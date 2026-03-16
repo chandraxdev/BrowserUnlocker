@@ -154,6 +154,7 @@
                 apply(target, thisArg, argumentsList) {
                     if (thisArg instanceof KeyboardEvent) {
                         const e = thisArg;
+                        if (!e.key) return Reflect.apply(target, thisArg, argumentsList);
                         if (protectedKeys.has(e.key)) return;
                         for (const combo of protectedCombos) {
                             if ((e.ctrlKey || e.metaKey) === !!combo.ctrl &&

@@ -265,7 +265,7 @@
 
         // Also protect Ctrl+C / Ctrl+X / Ctrl+A from being swallowed
         document.addEventListener('keydown', (e) => {
-            if (!features.enabled || !features.forceCopy) return;
+            if (!features.enabled || !features.forceCopy || !e.key) return;
             const key = e.key.toLowerCase();
             if ((e.ctrlKey || e.metaKey) && (key === 'c' || key === 'x' || key === 'a')) {
                 e.stopImmediatePropagation();
