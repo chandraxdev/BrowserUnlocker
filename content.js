@@ -25,6 +25,12 @@
     const dragDropRestoreState = new Map();
     const removedPrintRules = new Map();
 
+    // Register the message interceptor immediately — before the async GET_STATE
+    // round trip — so it's in place before monitoring extensions can relay their
+    // extension list. The handler checks features dynamically, so it activates
+    // as soon as GET_STATE populates features.extensionHide.
+    setupExtensionHide();
+
     // ─── Initialization & Messaging ──────────────────────────
     chrome.runtime.sendMessage({ type: 'GET_STATE' }, (state) => {
         if (chrome.runtime.lastError) return;
@@ -61,7 +67,6 @@
         setupOverlayRemoval();
         setupPrintUnlock();
         setupEnforcer();
-        setupExtensionHide();
 
         // Perform late sweeps once the full DOM is established, but only if enabled
         window.addEventListener('load', () => {
@@ -161,7 +166,7 @@
         if (injectedScriptEl) return;
         fetchInjectCode().then(code => {
             if (injectedScriptEl) return; // Guard against concurrent calls during async gap
-            window.__BU_INIT_FLAGS__ = { ...features, _extId: chrome.runtime.id };
+            window.__BU_INIT_FLAGS__ = { ...features };
             const s = document.createElement('script');
             s.textContent = code;
             (document.documentElement || document.head || document.body).prepend(s);
