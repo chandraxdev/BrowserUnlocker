@@ -1,26 +1,8 @@
 // ── BrowserUnlocker – Popup Logic ──
+// DEFAULT_STATE is provided by constants.js, loaded before this script.
 
 (function () {
     'use strict';
-
-    const DEFAULT_STATE = {
-        forcePaste: true,
-        forceCopy: true,
-        unlockSelection: true,
-        rightClick: true,
-        showPassword: true,
-        visibilityBypass: true,
-        keyboardUnblock: true,
-        overlayRemoval: true,
-        dragDropUnlock: true,
-        printUnlock: true,
-        scrollUnlock: true,
-        videoUnlock: true,
-        autocompleteUnlock: true,
-        beforeUnloadBypass: true,
-        zapperUnlock: true,
-        enabled: true
-    };
 
     const container = document.querySelector('.popup-container');
     const toggles = document.querySelectorAll('input[data-feature]');
@@ -49,21 +31,17 @@
     }
 
     // ── Save on change ────────────────────────────
+    // Read the current state directly from the DOM — the checkboxes already
+    // reflect persisted storage (populated in applyToggles). This avoids the
+    // async get→set race that could lose a rapid consecutive toggle change.
     toggles.forEach((el) => {
         el.addEventListener('change', () => {
             const key = el.dataset.feature;
+            if (key === 'enabled') updateDisabledState(el.checked);
 
-            chrome.storage.local.get('features', (result) => {
-                const features = result.features || { ...DEFAULT_STATE };
-                features[key] = el.checked;
-
-                // If master switch changed, update disabled state
-                if (key === 'enabled') {
-                    updateDisabledState(el.checked);
-                }
-
-                chrome.storage.local.set({ features });
-            });
+            const features = {};
+            toggles.forEach((t) => { features[t.dataset.feature] = t.checked; });
+            chrome.storage.local.set({ features });
         });
     });
 

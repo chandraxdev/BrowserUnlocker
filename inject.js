@@ -65,6 +65,10 @@
             state.blockedDocumentProps.add('hidden');
             state.blockedDocumentProps.add('visibilityState');
             state.blockedDocumentProps.add('onvisibilitychange');
+            // Trade-off: blocks ALL visibilitychange listeners (analytics, video
+            // pause-on-hide, etc.), not just anti-cheat or focus-tracking ones.
+            // This is intentional — there is no reliable way to distinguish
+            // legitimate from adversarial use of this event.
             state.blockedEvents.add('visibilitychange');
         }
 
@@ -106,6 +110,10 @@
             state.blockedWindowProps.add('onbeforeunload');
             state.blockedWindowProps.add('onunload');
             state.blockedEvents.add('beforeunload');
+            // Trade-off: 'unload' is blocked in addition to 'beforeunload' to
+            // prevent sites from firing exit dialogs via either event. This also
+            // silences legitimate unload cleanup (e.g. SPA router teardown).
+            // Accepted since SPAs primarily use pagehide/visibilitychange instead.
             state.blockedEvents.add('unload');
         }
     }
@@ -353,7 +361,7 @@
                 }
 
                 const funcStr = String(argumentsList[0]);
-                if (funcStr.includes('debugger')) return -1;
+                if (funcStr.includes('debugger')) return 0; // 0 is the no-op timer ID; clearTimeout(0) is safe
                 return Reflect.apply(target, thisArg, argumentsList);
             }
         });
@@ -365,7 +373,7 @@
                 }
 
                 const funcStr = String(argumentsList[0]);
-                if (funcStr.includes('debugger')) return -1;
+                if (funcStr.includes('debugger')) return 0; // 0 is the no-op timer ID; clearTimeout(0) is safe
                 return Reflect.apply(target, thisArg, argumentsList);
             }
         });

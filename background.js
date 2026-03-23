@@ -4,30 +4,7 @@
  * It handles persistent storage and broadcasts state changes to all active tabs.
  */
 
-const DEFAULT_STATE = {
-  // Core Unlocks
-  forcePaste: true,
-  forceCopy: true,
-  unlockSelection: true,
-  rightClick: true,
-  showPassword: true,
-  
-  // Advanced Interceptors
-  visibilityBypass: true,
-  keyboardUnblock: true,
-  overlayRemoval: true,
-  dragDropUnlock: true,
-  printUnlock: true,
-  
-  // Power Tools
-  scrollUnlock: true,
-  videoUnlock: true,
-  autocompleteUnlock: true,
-  beforeUnloadBypass: true,
-  zapperUnlock: true,    // Alt+Shift+Click element deleter
-  
-  enabled: true          // Main Master Switch
-};
+importScripts('constants.js'); // provides DEFAULT_STATE
 
 function getStoredFeatures(callback) {
   chrome.storage.local.get('features', (result) => {
@@ -72,11 +49,14 @@ chrome.storage.onChanged.addListener((changes, area) => {
   broadcastState(newFeatures);
 });
 
+// Schemes that never have a content script — skip them to avoid noisy failures.
+const SKIPPABLE_SCHEMES = ['chrome://', 'chrome-extension://', 'devtools://', 'about:'];
+
 // Relay state to every tab's content scripts
 function broadcastState(features) {
   chrome.tabs.query({}, (tabs) => {
     for (const tab of tabs) {
-      if (tab.id && tab.url && !tab.url.startsWith('chrome://')) {
+      if (tab.id && tab.url && !SKIPPABLE_SCHEMES.some((s) => tab.url.startsWith(s))) {
         chrome.tabs.sendMessage(tab.id, {
           type: 'STATE_UPDATE',
           features

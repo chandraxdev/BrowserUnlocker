@@ -326,9 +326,13 @@
     }
 
     // ─── Clipboard & Event Restoration ───────────────────────
+    // window capture fires before document capture in the propagation chain,
+    // so registering on window alone is sufficient to win the race against
+    // any site listener at any level. Registering on document as well would
+    // cause the handler to fire twice when stopImmediatePropagation is not
+    // called (i.e. when the feature is disabled).
     function addGlobalCaptureListener(type, handler) {
         window.addEventListener(type, handler, true);
-        document.addEventListener(type, handler, true);
     }
 
     /**
@@ -458,6 +462,12 @@
 
     // ─── Overlay Removal ─────────────────────────────────────
     function scanAndRemoveOverlays() {
+        // Prune entries for elements that have since been removed from the DOM
+        // to prevent the Map from holding strong references indefinitely.
+        for (const el of overlayRestoreState.keys()) {
+            if (!el.isConnected) overlayRestoreState.delete(el);
+        }
+
         document.querySelectorAll('div, section, aside').forEach((el) => {
             const style = getComputedStyle(el);
             const isOverlay =
@@ -504,6 +514,11 @@
 
     // ─── Drag & Drop Unlock ──────────────────────────────────
     function unlockExistingDraggables() {
+        // Prune entries for elements no longer in the DOM.
+        for (const el of dragDropRestoreState.keys()) {
+            if (!el.isConnected) dragDropRestoreState.delete(el);
+        }
+
         document.querySelectorAll('[draggable="false"]').forEach((el) => {
             if (!dragDropRestoreState.has(el)) {
                 dragDropRestoreState.set(el, el.getAttribute('draggable'));
@@ -541,8 +556,8 @@
                             rule.conditionText?.includes('print')) {
                             // Check if rules inside hide content
                             const ruleText = rule.cssText.toLowerCase();
-                            if (ruleText.includes('display') && ruleText.includes('none') ||
-                                ruleText.includes('visibility') && ruleText.includes('hidden')) {
+                            if ((ruleText.includes('display') && ruleText.includes('none')) ||
+                                (ruleText.includes('visibility') && ruleText.includes('hidden'))) {
                                 if (!removedPrintRules.has(sheet)) {
                                     removedPrintRules.set(sheet, []);
                                 }
@@ -587,7 +602,7 @@
 
     // ─── Element Zapper (Alt + Shift + Click to Delete) ──────
     function setupZapper() {
-        document.addEventListener('click', (e) => {
+        addGlobalCaptureListener('click', (e) => {
             if (!features.enabled || !features.zapperUnlock) return;
             // Native Alt + Shift + Click combination
             if (e.altKey && e.shiftKey) {
@@ -615,7 +630,7 @@
                 // Use the aggressive version since the user explicitly triggered this.
                 forceAggressiveScrollUnlock();
             }
-        }, true);
+        });
     }
 
 })();
