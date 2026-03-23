@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "BrowserUnlocker",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Take back your browser. Restore native paste, copy, text selection, right-click menus, and password visibility on any website.",
   "permissions": [
     "storage"
@@ -33,11 +33,5 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  },
-  "web_accessible_resources": [
-    {
-      "resources": ["inject.js"],
-      "matches": ["<all_urls>"]
-    }
-  ]
+  }
 }

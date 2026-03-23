@@ -24,5 +24,8 @@ const DEFAULT_STATE = {
   beforeUnloadBypass: true,
   zapperUnlock: true,   // Alt+Shift+Click element deleter
 
+  // Stealth
+  extensionHide: false, // Hide extension presence from detection scripts (opt-in)
+
   enabled: true         // Master switch
 };

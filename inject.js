@@ -6,12 +6,17 @@
 (function () {
     'use strict';
 
-    const scriptTag = document.currentScript;
-    if (!scriptTag) return;
-
     let incomingFlags = {};
     try {
-        incomingFlags = JSON.parse(scriptTag.dataset.flags || '{}');
+        const scriptTag = document.currentScript;
+        if (scriptTag && scriptTag.dataset.flags) {
+            // Legacy path: external src injection (kept for compatibility)
+            incomingFlags = JSON.parse(scriptTag.dataset.flags);
+        } else if (window.__BU_INIT_FLAGS__) {
+            // Inline injection path: flags delivered via window global
+            incomingFlags = window.__BU_INIT_FLAGS__;
+            delete window.__BU_INIT_FLAGS__;
+        }
     } catch (_) { }
 
     const STATE_KEY = '__browserUnlockerMainWorld';
@@ -29,6 +34,9 @@
     const origSetInterval = window.setInterval;
     const origSetTimeout = window.setTimeout;
     const nativePrint = window.print.bind(window);
+    const origFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+    const origXHROpen = XMLHttpRequest.prototype.open;
+    const origXHRSend = XMLHttpRequest.prototype.send;
     const propertyGateReplayers = [];
 
     const state = {
@@ -39,6 +47,9 @@
         pendingEventListeners: [],
         pendingDefineProperties: []
     };
+
+    // Captured once at init from the script tag — never changes, not a user flag.
+    const ownExtId = incomingFlags._extId || '';
 
     function featureEnabled(flagName) {
         return !!state.flags.enabled && !!state.flags[flagName];
@@ -434,5 +445,278 @@
                 blockedPrintAssignment = null;
             }
         });
+    } catch (_) { }
+
+    // ── Extension Hide ──────────────────────────────────────────────────────
+    // Defends against extension detection and monitoring extension relays.
+    //
+    // AV1 – Monitoring extensions relay chrome.management.getAll() results to
+    //        the page via postMessage. We intercept, sanitize (empty all extension
+    //        arrays), and re-dispatch — the site's listener still fires, just with
+    //        a clean payload reporting no extensions.
+    //
+    // AV2 – Sites WAR-probe for installed extensions via fetch / XHR.
+    //        Requests to our own extension ID are rejected (hide us).
+    //        Requests to any other extension ID return a fake 200 (appear installed).
+    //        This means a site probing for a required monitoring extension will
+    //        receive a success response even if that extension is not installed.
+    //
+    // AV3 – Sites enumerate injected DOM elements by src/href attribute.
+    //        content.js strips IDs; here we filter querySelectorAll / querySelector.
+    //
+    // Trade-off (AV1): Heuristic is probabilistic (score ≥ 2). A false-positive on
+    // a legitimate cross-origin message re-dispatches a sanitized copy — the listener
+    // still fires, just with empty extension arrays instead of being silently dropped.
+    //
+    // Trade-off (AV2): Returning fake 200 for all non-self extension URLs means
+    // the site cannot WAR-detect any extension, not just BrowserUnlocker.
+    // Accepted — this provides the strongest stealth posture.
+
+    // AV1 — postMessage interception: sanitize payload and re-dispatch
+    try {
+        const EXT_ID_RE = /\b[a-p]{32}\b/;
+        let _reDispatching = false;
+
+        function looksLikeExtensionPayload(data) {
+            if (!data || typeof data !== 'object') return false;
+            let score = 0;
+            let str = '';
+            try { str = JSON.stringify(data); } catch (_) { str = ''; }
+            if (EXT_ID_RE.test(str)) score++;
+            if (Array.isArray(data) && data.length > 0 && typeof data[0] === 'object' &&
+                (data[0]?.id || data[0]?.extensionId)) score++;
+            if ('extensions' in data || 'installedExtensions' in data || 'chromeExtensions' in data) score++;
+            if (typeof data.id === 'string' && EXT_ID_RE.test(data.id) && typeof data.name === 'string') score++;
+            return score >= 2;
+        }
+
+        function sanitizeExtensionPayload(data) {
+            if (Array.isArray(data)) return [];
+            const out = { ...data };
+            for (const key of ['extensions', 'installedExtensions', 'chromeExtensions', 'addons', 'plugins']) {
+                if (key in out) out[key] = [];
+            }
+            return out;
+        }
+
+        Reflect.apply(origAddEventListener, window, ['message', (e) => {
+            if (!featureEnabled('extensionHide') || _reDispatching) return;
+            try {
+                if (looksLikeExtensionPayload(e.data)) {
+                    e.stopImmediatePropagation();
+                    const sanitized = sanitizeExtensionPayload(e.data);
+                    _reDispatching = true;
+                    try {
+                        window.dispatchEvent(new MessageEvent('message', {
+                            data: sanitized,
+                            origin: e.origin,
+                            source: e.source,
+                            lastEventId: e.lastEventId
+                        }));
+                    } finally {
+                        _reDispatching = false;
+                    }
+                }
+            } catch (_) {}
+        }, true]);
+    } catch (_) { }
+
+    // Returns a content-type-aware fake 200 Response for extension URL probes.
+    // .js → empty script (avoids SyntaxError if site eval()s the response),
+    // .css → empty stylesheet, everything else → {} JSON.
+    function fakeExtensionResponse(url) {
+        const isJs = /\.js(\?|$)/.test(url);
+        const isCss = /\.css(\?|$)/.test(url);
+        const body = isJs ? '' : (isCss ? '' : '{}');
+        const type = isJs ? 'application/javascript' : (isCss ? 'text/css' : 'application/json');
+        return Promise.resolve(new Response(body, { status: 200, headers: { 'Content-Type': type } }));
+    }
+
+    // AV2 — fetch proxy: reject own-extension probes, fake 200 for all others
+    if (origFetch) {
+        try {
+            window.fetch = new Proxy(origFetch, {
+                apply(target, thisArg, args) {
+                    if (featureEnabled('extensionHide')) {
+                        const raw = typeof args[0] === 'string' ? args[0] :
+                            (args[0] instanceof URL ? args[0].href : String(args[0]?.url ?? ''));
+                        if (/^(chrome|moz|safari)-extension:\/\//.test(raw)) {
+                            if (ownExtId && raw.includes(ownExtId)) {
+                                // Our own extension — reject so we stay invisible
+                                return Promise.reject(new TypeError('Failed to fetch'));
+                            }
+                            // Any other extension — fake content-type-aware 200
+                            return fakeExtensionResponse(raw);
+                        }
+                    }
+                    return Reflect.apply(target, thisArg, args);
+                }
+            });
+        } catch (_) { }
+    }
+
+    // AV2 — XHR proxy: reject own-extension probes, fake 200 for all others
+    try {
+        const _buXhrMode = Symbol('buXhrMode'); // 'reject' | 'fake200' | false
+        const _buXhrUrl  = Symbol('buXhrUrl');  // stores URL for content-type detection
+
+        XMLHttpRequest.prototype.open = new Proxy(origXHROpen, {
+            apply(target, thisArg, args) {
+                const url = String(args[1] ?? '');
+                if (featureEnabled('extensionHide') &&
+                    /^(chrome|moz|safari)-extension:\/\//.test(url)) {
+                    thisArg[_buXhrMode] = (ownExtId && url.includes(ownExtId)) ? 'reject' : 'fake200';
+                    thisArg[_buXhrUrl]  = url;
+                    return;
+                }
+                thisArg[_buXhrMode] = false;
+                return Reflect.apply(target, thisArg, args);
+            }
+        });
+
+        XMLHttpRequest.prototype.send = new Proxy(origXHRSend, {
+            apply(target, thisArg, args) {
+                const mode = thisArg[_buXhrMode];
+                if (mode === 'reject') {
+                    Reflect.apply(origSetTimeout, window, [() => {
+                        try { thisArg.dispatchEvent(new ProgressEvent('error')); } catch (_) {}
+                    }, 0]);
+                    return;
+                }
+                if (mode === 'fake200') {
+                    const url = thisArg[_buXhrUrl] || '';
+                    const isJs = /\.js(\?|$)/.test(url);
+                    const isCss = /\.css(\?|$)/.test(url);
+                    const body = isJs ? '' : (isCss ? '' : '{}');
+                    Reflect.apply(origSetTimeout, window, [() => {
+                        try {
+                            origDefineProperty(thisArg, 'readyState', { get: () => 4, configurable: true });
+                            origDefineProperty(thisArg, 'status', { get: () => 200, configurable: true });
+                            origDefineProperty(thisArg, 'responseText', { get: () => body, configurable: true });
+                            origDefineProperty(thisArg, 'response', { get: () => body, configurable: true });
+                            thisArg.dispatchEvent(new ProgressEvent('load'));
+                            thisArg.dispatchEvent(new ProgressEvent('loadend'));
+                        } catch (_) {}
+                    }, 0]);
+                    return;
+                }
+                return Reflect.apply(target, thisArg, args);
+            }
+        });
+    } catch (_) { }
+
+    // AV3 — DOM trace defense: filter extension-origin elements from query results
+    try {
+        const origQSA = Document.prototype.querySelectorAll;
+        const origQS = Document.prototype.querySelector;
+
+        function isExtensionElement(el) {
+            const src = el.getAttribute ? (el.getAttribute('src') || '') : '';
+            const href = el.getAttribute ? (el.getAttribute('href') || '') : '';
+            return /^(chrome|moz|safari)-extension:\/\//.test(src) ||
+                /^(chrome|moz|safari)-extension:\/\//.test(href);
+        }
+
+        Document.prototype.querySelectorAll = new Proxy(origQSA, {
+            apply(target, thisArg, args) {
+                const results = Reflect.apply(target, thisArg, args);
+                if (!featureEnabled('extensionHide')) return results;
+                const arr = Array.from(results);
+                const filtered = arr.filter((el) => !isExtensionElement(el));
+                if (filtered.length === arr.length) return results;
+                return Object.assign(filtered, { item: (i) => filtered[i] ?? null });
+            }
+        });
+
+        Document.prototype.querySelector = new Proxy(origQS, {
+            apply(target, thisArg, args) {
+                const result = Reflect.apply(target, thisArg, args);
+                if (!featureEnabled('extensionHide')) return result;
+                if (result && isExtensionElement(result)) return null;
+                return result;
+            }
+        });
+    } catch (_) { }
+
+    // AV4 — Performance API: filter extension-origin entries from timing data
+    // Sites call performance.getEntries() / getEntriesByType('resource') to find
+    // chrome-extension:// URLs that appear when an extension injects resources.
+    // With inline injection inject.js never appears here — but other extensions or
+    // future code might, so we filter proactively.
+    try {
+        const EXT_PERF_RE = /^(chrome|moz|safari)-extension:\/\//;
+
+        function filterPerfEntries(entries) {
+            const arr = Array.from(entries);
+            return arr.filter(e => !EXT_PERF_RE.test(e.name));
+        }
+
+        const origGetEntries        = Performance.prototype.getEntries;
+        const origGetEntriesByType  = Performance.prototype.getEntriesByType;
+        const origGetEntriesByName  = Performance.prototype.getEntriesByName;
+
+        Performance.prototype.getEntries = new Proxy(origGetEntries, {
+            apply(target, thisArg, args) {
+                const r = Reflect.apply(target, thisArg, args);
+                return featureEnabled('extensionHide') ? filterPerfEntries(r) : r;
+            }
+        });
+
+        Performance.prototype.getEntriesByType = new Proxy(origGetEntriesByType, {
+            apply(target, thisArg, args) {
+                const r = Reflect.apply(target, thisArg, args);
+                return featureEnabled('extensionHide') ? filterPerfEntries(r) : r;
+            }
+        });
+
+        Performance.prototype.getEntriesByName = new Proxy(origGetEntriesByName, {
+            apply(target, thisArg, args) {
+                const r = Reflect.apply(target, thisArg, args);
+                return featureEnabled('extensionHide') ? filterPerfEntries(r) : r;
+            }
+        });
+    } catch (_) { }
+
+    // AV5 — Navigator probing: mask plugins / mimeTypes with empty frozen arrays
+    // Modern Chrome already returns empty PluginArrays in most contexts, but
+    // some detection scripts still enumerate navigator.plugins as a fingerprint.
+    try {
+        const _emptyPluginArray = Object.freeze(
+            Object.assign([], { item: () => null, namedItem: () => null, refresh: () => {} })
+        );
+        const _emptyMimeTypeArray = Object.freeze(
+            Object.assign([], { item: () => null, namedItem: () => null })
+        );
+
+        const pluginsDesc    = findDescriptor(Navigator.prototype, 'plugins') ||
+                               findDescriptor(navigator, 'plugins');
+        const mimeTypesDesc  = findDescriptor(Navigator.prototype, 'mimeTypes') ||
+                               findDescriptor(navigator, 'mimeTypes');
+
+        if (pluginsDesc) {
+            origDefineProperty(Navigator.prototype, 'plugins', {
+                get() {
+                    if (!featureEnabled('extensionHide')) {
+                        return pluginsDesc.get ? pluginsDesc.get.call(this) : pluginsDesc.value;
+                    }
+                    return _emptyPluginArray;
+                },
+                configurable: pluginsDesc.configurable ?? true,
+                enumerable:   pluginsDesc.enumerable   ?? true
+            });
+        }
+
+        if (mimeTypesDesc) {
+            origDefineProperty(Navigator.prototype, 'mimeTypes', {
+                get() {
+                    if (!featureEnabled('extensionHide')) {
+                        return mimeTypesDesc.get ? mimeTypesDesc.get.call(this) : mimeTypesDesc.value;
+                    }
+                    return _emptyMimeTypeArray;
+                },
+                configurable: mimeTypesDesc.configurable ?? true,
+                enumerable:   mimeTypesDesc.enumerable   ?? true
+            });
+        }
     } catch (_) { }
 })();

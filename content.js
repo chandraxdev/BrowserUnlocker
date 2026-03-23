@@ -61,6 +61,7 @@
         setupOverlayRemoval();
         setupPrintUnlock();
         setupEnforcer();
+        setupExtensionHide();
 
         // Perform late sweeps once the full DOM is established, but only if enabled
         window.addEventListener('load', () => {
@@ -103,6 +104,15 @@
 
         if (features.printUnlock) cleanPrintStyles();
         else restorePrintStyles();
+
+        // Hide extension-injected element IDs from page scripts in stealth mode
+        if (features.extensionHide) {
+            if (injectedStyleEl) injectedStyleEl.removeAttribute('id');
+            if (scrollStyleEl) scrollStyleEl.removeAttribute('id');
+        } else {
+            if (injectedStyleEl && !injectedStyleEl.id) injectedStyleEl.id = 'bu-unlock-selection';
+            if (scrollStyleEl && !scrollStyleEl.id) scrollStyleEl.id = 'bu-unlock-scroll';
+        }
     }
 
     function removeAll() {
@@ -134,16 +144,32 @@
     }
 
     // ─── Inject page-context script ──────────────────────────
+    // Inline injection: fetch inject.js via the content-script context (no WAR
+    // needed) and set it as textContent. The resulting <script> tag has no src
+    // attribute — it is indistinguishable from any other inline page script and
+    // produces no chrome-extension:// entries in the DOM, network log, or
+    // performance timeline.
+    let _injectCodePromise = null;
+    function fetchInjectCode() {
+        if (!_injectCodePromise) {
+            _injectCodePromise = fetch(chrome.runtime.getURL('inject.js')).then(r => r.text());
+        }
+        return _injectCodePromise;
+    }
+
     function injectPageScript() {
         if (injectedScriptEl) return;
-        try {
+        fetchInjectCode().then(code => {
+            if (injectedScriptEl) return; // Guard against concurrent calls during async gap
+            window.__BU_INIT_FLAGS__ = { ...features, _extId: chrome.runtime.id };
             const s = document.createElement('script');
-            s.src = chrome.runtime.getURL('inject.js');
-            s.dataset.flags = JSON.stringify(features);
-            s.onload = () => s.remove();
+            s.textContent = code;
             (document.documentElement || document.head || document.body).prepend(s);
             injectedScriptEl = s;
-        } catch (_) { }
+            s.remove(); // Inline scripts execute synchronously on insertion; remove from DOM to leave no trace
+            // Re-sync flags in case state changed while fetching (_extId already captured by inject.js at init)
+            document.dispatchEvent(new CustomEvent('BU_UPDATE_FLAGS', { detail: features }));
+        }).catch(() => {});
     }
 
     // ─── Unlock Selection CSS ────────────────────────────────
@@ -598,6 +624,52 @@
         printStyleObserver.observe(document.documentElement, {
             childList: true, subtree: true
         });
+    }
+
+    // ─── Extension Hide (Stealth Mode) ──────────────────────
+    // Belt-and-suspenders: content-world capture listener for postMessage relays.
+    // Registered before inject.js loads (async), so it guards the brief window
+    // between page script execution and inject.js initialisation.
+    // Mirrors inject.js AV1: intercept → sanitize → re-dispatch, so site listeners
+    // still receive a response (empty extension list) rather than stalling.
+    function setupExtensionHide() {
+        const EXT_ID_RE = /\b[a-p]{32}\b/;
+        let _reDispatching = false;
+
+        window.addEventListener('message', (e) => {
+            if (!features.enabled || !features.extensionHide || _reDispatching) return;
+            try {
+                const data = e.data;
+                if (!data || typeof data !== 'object') return;
+                let score = 0;
+                let str = '';
+                try { str = JSON.stringify(data); } catch (_) { str = ''; }
+                if (EXT_ID_RE.test(str)) score++;
+                if (Array.isArray(data) && data.length > 0 && typeof data[0] === 'object' &&
+                    (data[0]?.id || data[0]?.extensionId)) score++;
+                if ('extensions' in data || 'installedExtensions' in data) score++;
+                if (score < 2) return;
+
+                e.stopImmediatePropagation();
+                const sanitized = Array.isArray(data) ? [] : { ...data };
+                if (!Array.isArray(sanitized)) {
+                    for (const key of ['extensions', 'installedExtensions', 'chromeExtensions', 'addons', 'plugins']) {
+                        if (key in sanitized) sanitized[key] = [];
+                    }
+                }
+                _reDispatching = true;
+                try {
+                    window.dispatchEvent(new MessageEvent('message', {
+                        data: sanitized,
+                        origin: e.origin,
+                        source: e.source,
+                        lastEventId: e.lastEventId
+                    }));
+                } finally {
+                    _reDispatching = false;
+                }
+            } catch (_) {}
+        }, true);
     }
 
     // ─── Element Zapper (Alt + Shift + Click to Delete) ──────
